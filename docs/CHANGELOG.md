@@ -6,6 +6,8 @@
 
 - feat: make `IdbStorage` `get/set` methods generic
 - chore: add context to errors thrown when failing to decode CBOR values.
+- feat: make actor calls return raw certificate, if requested
+- fix: `pollForResponse` invalid parameters order in update calls 
 
 ## [1.2.0] - 2024-03-25
 
