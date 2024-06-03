@@ -22,6 +22,7 @@ export type PollStrategyFactory = () => PollStrategy;
  * @param strategy A polling strategy.
  * @param request Request for the readState call.
  * @param blsVerify - optional replacement function that verifies the BLS signature of a certificate.
+ * @param onRawCertificatePolled - optional callback that will trigger when the certificate is available
  */
 export async function pollForResponse(
   agent: Agent,
@@ -31,6 +32,7 @@ export async function pollForResponse(
   // eslint-disable-next-line
   request?: any,
   blsVerify?: CreateCertificateOptions['blsVerify'],
+  onRawCertificatePolled?: (cert: ArrayBuffer) => void,
 ): Promise<ArrayBuffer> {
   const path = [new TextEncoder().encode('request_status'), requestId];
   const currentRequest = request ?? (await agent.createReadStateRequest?.({ paths: [path] }));
@@ -53,6 +55,8 @@ export async function pollForResponse(
 
   switch (status) {
     case RequestStatusResponseStatus.Replied: {
+      onRawCertificatePolled?.(state.certificate);
+
       return cert.lookup([...path, 'reply'])!;
     }
 
@@ -61,7 +65,15 @@ export async function pollForResponse(
     case RequestStatusResponseStatus.Processing:
       // Execute the polling strategy, then retry.
       await strategy(canisterId, requestId, status);
-      return pollForResponse(agent, canisterId, requestId, strategy, currentRequest);
+      return pollForResponse(
+        agent,
+        canisterId,
+        requestId,
+        strategy,
+        currentRequest,
+        blsVerify,
+        onRawCertificatePolled,
+      );
 
     case RequestStatusResponseStatus.Rejected: {
       const rejectCode = new Uint8Array(cert.lookup([...path, 'reject_code'])!)[0];

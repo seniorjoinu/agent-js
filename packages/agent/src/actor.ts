@@ -17,6 +17,7 @@ import { toHex } from './utils/buffer';
 import { CreateCertificateOptions } from './certificate';
 import managementCanisterIdl from './canisters/management_idl';
 import _SERVICE, { canister_settings } from './canisters/management_service';
+import { removeElement } from './utils/array';
 
 export class ActorCallError extends AgentError {
   constructor(
@@ -102,6 +103,31 @@ export interface CallConfig {
    * The effective canister ID. This should almost always be ignored.
    */
   effectiveCanisterId?: Principal;
+
+  /**
+   * A callback function that triggers when an update message is
+   * already submitted, but the result is not yet polled.
+   * Ignored for query calls.
+   * @param reqId - RequestId of the submitted update message
+   * @returns
+   */
+  onBeforePollingStart?: (reqId: RequestId) => void;
+
+  /**
+   * A flag, that makes an update call skip sending the message and instead
+   * start polling for the request path immediately.
+   * Ignored for query calls. Using on update calls with http-details will trap.
+   */
+  onlyPoll?: RequestId;
+
+  /**
+   * A callback that gets executed when the raw certificate is polled during
+   * an update call.
+   * Ignored for query calls.
+   * @param cert - ArrayBuffer of the raw certificate
+   * @returns
+   */
+  onRawCertificatePolled?: (cert: ArrayBuffer) => void;
 }
 
 /**
@@ -349,6 +375,20 @@ export class Actor {
           }
 
           this[methodName] = _createActorMethod(this, methodName, func, config.blsVerify);
+
+          // for query calls also add replicated versions of methods
+          const funcCopy = structuredClone(func);
+          const queryRemoved = removeElement(funcCopy.annotations, 'query');
+          const compositeQueryRemoved = removeElement(funcCopy.annotations, 'composite_query');
+
+          if (queryRemoved || compositeQueryRemoved) {
+            this[`${methodName}_replicated`] = _createActorMethod(
+              this,
+              methodName,
+              funcCopy,
+              config.blsVerify,
+            );
+          }
         }
       }
     }
@@ -461,6 +501,12 @@ function _createActorMethod(
         }),
       };
 
+      // check if the method should include http details
+      // onlyPoll can only be used against methods which not
+      const shouldIncludeHttpDetails = func.annotations.includes(ACTOR_METHOD_WITH_HTTP_DETAILS);
+      if (shouldIncludeHttpDetails && options.onlyPoll)
+        throw new Error('Invalid input: onlyPoll option is unavailable for http-details methods');
+
       const agent = options.agent || actor[metadataSymbol].config.agent || getDefaultAgent();
       const { canisterId, effectiveCanisterId, pollingStrategyFactory } = {
         ...DEFAULT_ACTOR_CONFIG,
@@ -469,32 +515,51 @@ function _createActorMethod(
       };
       const cid = Principal.from(canisterId);
       const ecid = effectiveCanisterId !== undefined ? Principal.from(effectiveCanisterId) : cid;
-      const arg = IDL.encode(func.argTypes, args);
-      const { requestId, response } = await agent.call(cid, {
-        methodName,
-        arg,
-        effectiveCanisterId: ecid,
-      });
 
-      if (!response.ok || response.body /* IC-1462 */) {
-        throw new UpdateCallRejectedError(cid, methodName, requestId, response);
+      let requestId: RequestId, response: SubmitResponse['response'];
+
+      if (!options.onlyPoll) {
+        const arg = IDL.encode(func.argTypes, args);
+        const { requestId: reqId, response: res } = await agent.call(cid, {
+          methodName,
+          arg,
+          effectiveCanisterId: ecid,
+        });
+
+        requestId = reqId;
+        response = res;
+
+        if (!response.ok || response.body /* IC-1462 */) {
+          throw new UpdateCallRejectedError(cid, methodName, requestId, response);
+        }
+      } else {
+        requestId = options.onlyPoll;
       }
 
+      options.onBeforePollingStart?.(requestId);
+
       const pollStrategy = pollingStrategyFactory();
-      const responseBytes = await pollForResponse(agent, ecid, requestId, pollStrategy, blsVerify);
-      const shouldIncludeHttpDetails = func.annotations.includes(ACTOR_METHOD_WITH_HTTP_DETAILS);
+      const responseBytes = await pollForResponse(
+        agent,
+        ecid,
+        requestId,
+        pollStrategy,
+        undefined,
+        blsVerify,
+        options.onRawCertificatePolled,
+      );
 
       if (responseBytes !== undefined) {
         return shouldIncludeHttpDetails
           ? {
-              httpDetails: response,
+              httpDetails: response!,
               result: decodeReturnValue(func.retTypes, responseBytes),
             }
           : decodeReturnValue(func.retTypes, responseBytes);
       } else if (func.retTypes.length === 0) {
         return shouldIncludeHttpDetails
           ? {
-              httpDetails: response,
+              httpDetails: response!,
               result: undefined,
             }
           : undefined;
